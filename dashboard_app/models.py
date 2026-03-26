@@ -12,4 +12,7 @@ class OrderItem:
     text: str
     color: str  # Tkinter fill color for the status circle.
     type: str
+    prod_color: str | None = None  # Optional second circle for production status.
+    client_name: str = ""
+    revisa_letters: str = ""
 

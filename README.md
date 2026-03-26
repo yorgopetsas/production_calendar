@@ -30,6 +30,22 @@ It refreshes automatically once per hour (and you can also click `Refresh now`).
 From the workspace root (`dashboard`):
 
 ```powershell
-python -m dashboard_app.app
+python -m dashboard_app
 ```
 
+## 4) Build Windows EXE
+
+1. Ensure `dashboard_app/secret_store.py` has your generated encrypted values.
+2. Build:
+
+```powershell
+.\build_exe.ps1
+```
+
+3. Deliver the following to office PCs:
+   - `dist\DashboardPedidos.exe`
+   - `dist\config.json`
+
+4. On target PCs, install:
+   - Microsoft ODBC Driver 17 for SQL Server
+   - Microsoft Visual C++ Redistributable (if missing)

@@ -23,6 +23,57 @@ def _sanitize_identifier(identifier: str) -> str:
     return identifier
 
 
+def _odbc_escape(value: str) -> str:
+    """
+    Escape ODBC connection-string values.
+    Braced values allow special chars like ';' and spaces.
+    """
+    s = str(value).replace("}", "}}")
+    return "{" + s + "}"
+
+
+def _candidate_drivers(preferred: str) -> List[str]:
+    # Try preferred first, then common SQL Server ODBC drivers.
+    candidates = [preferred, "ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server"]
+    # Preserve order while removing duplicates.
+    out: List[str] = []
+    seen = set()
+    for d in candidates:
+        if d and d not in seen:
+            out.append(d)
+            seen.add(d)
+    return out
+
+
+def _connect_sql(settings: Settings, timeout: int = 10):
+    installed = set(pyodbc.drivers())
+    tried: List[str] = []
+    for drv in _candidate_drivers(settings.db_driver):
+        if drv not in installed:
+            continue
+        tried.append(drv)
+        conn_str = (
+            f"DRIVER={_odbc_escape(drv)};"
+            f"SERVER={settings.db_server},{settings.db_port};"
+            f"DATABASE={_odbc_escape(settings.db_name)};"
+            f"UID={_odbc_escape(settings.db_user)};"
+            f"PWD={_odbc_escape(settings.db_password)};"
+            f"TrustServerCertificate=yes;"
+        )
+        try:
+            return pyodbc.connect(conn_str, timeout=timeout)
+        except pyodbc.Error:
+            # Try next candidate driver.
+            continue
+
+    available = ", ".join(sorted(installed)) if installed else "(none)"
+    raise RuntimeError(
+        "Unable to connect with available SQL Server ODBC drivers. "
+        f"Tried: {tried or _candidate_drivers(settings.db_driver)}. "
+        f"Installed drivers: {available}."
+    )
+
+
 def _to_date(val) -> date:
     if val is None:
         raise ValueError("Unexpected NULL date value.")
@@ -52,6 +103,8 @@ def fetch_orders_by_date(
     settings: Settings,
     start_dt: datetime,
     end_dt: datetime,
+    include_shipped: bool = False,
+    tip_ped_values: List[str] | None = None,
 ) -> Dict[date, List[OrderItem]]:
     """
     Fetch orders whose delivery date overlaps the given [start_dt, end_dt) window.
@@ -62,6 +115,7 @@ def fetch_orders_by_date(
     delivery_date_col = _sanitize_identifier(settings.delivery_date_field)
     client_name_col = _sanitize_identifier("NomCli")
     order_type_col = _sanitize_identifier("TipPed")
+    cod_eje_col = _sanitize_identifier("CodEje")
     status_cols = [
         _sanitize_identifier("RevisaVen"),
         _sanitize_identifier("RevisaCom"),
@@ -71,42 +125,118 @@ def fetch_orders_by_date(
         _sanitize_identifier("RevisaAlm"),
     ]
     status_expr = ", ".join(status_cols)
-    order_type = _sanitize_identifier("TipPed")
+    prod_table = _sanitize_identifier("dbo.OrdProdCab")
 
-    # Note: identifiers can't be passed as SQL parameters; only values can.
-    # If delivery_date_col is a varchar, converting in SQL avoids relying on implicit conversion rules.
+    # Step 1: fetch calendar orders from CabPedCli.
     delivery_expr = f"TRY_CONVERT(datetime, {delivery_date_col})"
-    sql = (
-        f"SELECT {order_id_col}, {delivery_expr}, {client_name_col}, {order_type}, {status_expr} "
-        f"FROM {table} "
-        f"WHERE {delivery_expr} >= ? AND {delivery_expr} < ? AND CodSer = 'B' AND (TipPed = '1    ' OR TipPed = '2    ' OR TipPed = '3    ') "
-        f"ORDER BY {delivery_expr}, {order_id_col}"
-    )
+    years = sorted({start_dt.year, (end_dt - datetime.resolution).year})
+    if len(years) == 1:
+        years_where = f"{cod_eje_col} = ?"
+        years_params = [years[0]]
+    else:
+        years_where = f"{cod_eje_col} IN (?, ?)"
+        years_params = [years[0], years[1]]
 
-    conn_str = (
-        f"DRIVER={{{settings.db_driver}}};"
-        f"SERVER={settings.db_server},{settings.db_port};"
-        f"DATABASE={settings.db_name};"
-        f"UID={settings.db_user};"
-        f"PWD={settings.db_password};"
-        f"TrustServerCertificate=yes;"
+    if not tip_ped_values:
+        tip_ped_values = ["1", "2", "3"]
+    tip_placeholders = ",".join("?" for _ in tip_ped_values)
+
+    sql_orders = (
+        f"SELECT {order_id_col}, {delivery_expr}, {client_name_col}, {order_type_col}, {status_expr} "
+        f"FROM {table} "
+        f"WHERE {delivery_expr} >= ? AND {delivery_expr} < ? "
+        f"  AND LTRIM(RTRIM(CAST(CodSer AS varchar(20)))) = 'B' "
+        f"  AND LTRIM(RTRIM(CAST(TipPed AS varchar(20)))) IN ({tip_placeholders}) "
+        f"  AND {years_where} "
+        f"ORDER BY {delivery_expr}, {client_name_col}, {order_id_col}"
     )
 
     orders_by_day: Dict[date, List[OrderItem]] = {}
-    with pyodbc.connect(conn_str, timeout=10) as conn:
-        # Use a read-only, forward-only cursor for speed.
+    with _connect_sql(settings, timeout=10) as conn:
         cursor = conn.cursor()
-        cursor.execute(sql, (start_dt, end_dt))
-        for row in cursor.fetchall():
+        cursor.execute(sql_orders, [start_dt, end_dt, *tip_ped_values, *years_params])
+        order_rows = cursor.fetchall()
+        if not order_rows:
+            return orders_by_day
+
+        shipped_order_ids: set[int] = set()
+        if not include_shipped:
+            # Exclude orders already shipped (present in CabAlb by CodPed).
+            alb_table = _sanitize_identifier("dbo.CabAlb")
+            order_ids_for_alb: List[int] = []
+            for r in order_rows:
+                try:
+                    order_ids_for_alb.append(int(r[0]))
+                except Exception:
+                    continue
+            order_ids_for_alb = sorted(set(order_ids_for_alb))
+            if order_ids_for_alb:
+                placeholders = ",".join("?" for _ in order_ids_for_alb)
+                sql_alb = (
+                    f"SELECT DISTINCT CodPed "
+                    f"FROM {alb_table} "
+                    f"WHERE CodPed IN ({placeholders})"
+                )
+                cursor.execute(sql_alb, order_ids_for_alb)
+                for ar in cursor.fetchall():
+                    try:
+                        shipped_order_ids.add(int(ar[0]))
+                    except Exception:
+                        pass
+
+        # Step 2: fetch production counts from OrdProdCab for ALL listed orders.
+        order_ids_numeric: List[int] = []
+        for r in order_rows:
+            try:
+                order_ids_numeric.append(int(r[0]))
+            except Exception:
+                continue
+        order_ids_numeric = sorted(set(order_ids_numeric))
+
+        prod_counts: Dict[int, tuple[int, int, int]] = {}
+        if order_ids_numeric:
+            placeholders = ",".join("?" for _ in order_ids_numeric)
+            sql_prod = (
+                f"SELECT p.CodPed, COUNT(*) AS total_prod, "
+                f"       SUM(CASE WHEN TRY_CONVERT(int, p.Estado) = 0 THEN 1 ELSE 0 END) AS estado_0_count, "
+                f"       SUM(CASE WHEN TRY_CONVERT(int, p.Estado) = 2 THEN 1 ELSE 0 END) AS estado_2_count "
+                f"FROM {prod_table} p "
+                f"WHERE p.CodPed IN ({placeholders}) "
+                f"GROUP BY p.CodPed"
+            )
+            cursor.execute(sql_prod, order_ids_numeric)
+            for pr in cursor.fetchall():
+                cod_ped = int(pr[0])
+                prod_counts[cod_ped] = (int(pr[1] or 0), int(pr[2] or 0), int(pr[3] or 0))
+
+        for row in order_rows:
             order_id = row[0]
+            try:
+                oid_check = int(order_id)
+            except Exception:
+                oid_check = None
+            if (not include_shipped) and oid_check is not None and oid_check in shipped_order_ids:
+                # Order already exists in CabAlb => sent, do not display.
+                continue
+
             delivery_dt = row[1]
             client_name = row[2]
             order_type = row[3]
-            status_vals = row[4:]
+            status_vals = row[4:10]
             day = _to_date(delivery_dt)
             # Display format requested: `ORDER_ID - ClientName`.
             suffix = str(client_name).strip() if client_name is not None else ""
             text = f"{order_id} - {suffix}" if suffix else str(order_id)
+
+            order_type_raw = str(order_type).strip() if order_type is not None else ""
+            if order_type_raw.startswith("1"):
+                order_type_tag = "COM"
+            elif order_type_raw.startswith("2"):
+                order_type_tag = "MAN"
+            elif order_type_raw.startswith("3"):
+                order_type_tag = "BOT"
+            else:
+                order_type_tag = order_type_raw
 
             # Color rule:
             # - all True => green
@@ -120,7 +250,55 @@ def fetch_orders_by_date(
             else:
                 color = "#f1c40f"  # yellow
 
-            orders_by_day.setdefault(day, []).append(OrderItem(text=text, color=color, type=order_type))
+            # Build summary letters for selected Revisa fields:
+            # Ventas/Comercial/Botoneras/Produccion/Almacen => V/C/B/P/A
+            # Fixed-width 5-slot pattern so company names align in UI.
+            # Order: Ventas/Comercial/Botoneras/Produccion/Almacen => V/C/B/P/A
+            v = "V" if len(bools) >= 1 and bools[0] else "-"
+            c = "C" if len(bools) >= 2 and bools[1] else "-"
+            b = "B" if len(bools) >= 3 and bools[2] else "-"
+            p = "P" if len(bools) >= 4 and bools[3] else "-"
+            a = "A" if len(bools) >= 6 and bools[5] else "-"
+            revisa_letters = f"{v}/{c}/{b}/{p}/{a}"
+
+            # Production-order color (second light), from OrdProdCab by CodPed.
+            # - if all related production orders are Estado=0 -> green
+            # - if all related production orders are Estado=2 -> red
+            # - otherwise -> yellow
+            # If there are no production orders, no second light is shown.
+            prod_color = None
+            try:
+                oid_num = int(order_id)
+            except Exception:
+                oid_num = None
+            total_prod, estado_0_count, estado_2_count = (0, 0, 0)
+            if oid_num is not None:
+                total_prod, estado_0_count, estado_2_count = prod_counts.get(oid_num, (0, 0, 0))
+            if total_prod > 0:
+                if estado_0_count == total_prod:
+                    prod_color = "#2ecc71"
+                elif estado_2_count == total_prod:
+                    prod_color = "#e74c3c"
+                else:
+                    prod_color = "#f1c40f"
+            else:
+                # Skip orders without production rows, as requested previously.
+                continue
+
+            orders_by_day.setdefault(day, []).append(
+                OrderItem(
+                    text=text,
+                    color=color,
+                    type=order_type_tag,
+                    prod_color=prod_color,
+                    client_name=suffix,
+                    revisa_letters=revisa_letters,
+                )
+            )
+
+    # Final per-day ordering: group by client name, then by display text.
+    for day, items in orders_by_day.items():
+        items.sort(key=lambda x: ((x.client_name or "").lower(), x.text.lower()))
 
     return orders_by_day
 
@@ -147,23 +325,69 @@ def fetch_order_revisa_fields(
     revisa_cols_sanitized = [_sanitize_identifier(c) for c in revisa_cols]
     select_expr = ", ".join(revisa_cols_sanitized)
 
-    sql = f"SELECT {select_expr} FROM {table} WHERE {order_id_col} = ?"
-
-    conn_str = (
-        f"DRIVER={{{settings.db_driver}}};"
-        f"SERVER={settings.db_server},{settings.db_port};"
-        f"DATABASE={settings.db_name};"
-        f"UID={settings.db_user};"
-        f"PWD={settings.db_password};"
-        f"TrustServerCertificate=yes;"
+    prod_table = _sanitize_identifier("dbo.OrdProdCab")
+    # Production-order counts must be based on the clicked order id parameter.
+    sql = (
+        f"SELECT {select_expr}, "
+        f"       (SELECT COUNT(*) FROM {prod_table} p WHERE p.CodPed = TRY_CONVERT(numeric(18,0), ?)) AS prod_total, "
+        f"       (SELECT COUNT(*) FROM {prod_table} p WHERE p.CodPed = TRY_CONVERT(numeric(18,0), ?) AND LTRIM(RTRIM(CAST(p.Estado AS varchar(50)))) = '2') AS prod_estado2 "
+        f"FROM {table} WHERE {order_id_col} = ?"
     )
 
-    with pyodbc.connect(conn_str, timeout=10) as conn:
+    with _connect_sql(settings, timeout=10) as conn:
         cursor = conn.cursor()
-        cursor.execute(sql, (order_id,))
+        cursor.execute(sql, (order_id, order_id, order_id))
         row = cursor.fetchone()
         if row is None:
             return None
 
-        return {col: row[idx] for idx, col in enumerate(revisa_cols_sanitized)}
+        out = {col: row[idx] for idx, col in enumerate(revisa_cols_sanitized)}
+        out["_prod_total"] = row[len(revisa_cols_sanitized)] or 0
+        out["_prod_estado2"] = row[len(revisa_cols_sanitized) + 1] or 0
+        return out
+
+
+def fetch_order_item_rows(
+    settings: Settings,
+    order_id: str,
+) -> List[Dict[str, object]]:
+    """
+    Fetch row-level data for an order, including product description.
+    Source requested by user: CabPedCli by CodPed, then Articulos by CodArt.
+    Implemented as one LEFT JOIN for efficiency.
+    """
+    cab_table = _sanitize_identifier(settings.orders_table)  # usually dbo.CabPedCli
+    art_table = _sanitize_identifier("dbo.Articulos")
+    order_id_col = _sanitize_identifier(settings.order_id_field)  # usually CodPed
+    codart_col = _sanitize_identifier("CodArt")
+    obs_col = _sanitize_identifier("Obs")
+    estado_col = _sanitize_identifier("Estado")
+    desart_col = _sanitize_identifier("DesArt")
+
+    # As requested:
+    # - row list comes from OrdProdCab (filtered by CodPed)
+    # - product name (DesArt) comes from Articulos by CodArt
+    prod_table = _sanitize_identifier("dbo.OrdProdCab")
+    sql = (
+        f"SELECT p.{codart_col}, p.{obs_col}, p.{estado_col}, a.{desart_col} "
+        f"FROM {prod_table} p "
+        f"LEFT JOIN {art_table} a ON a.{codart_col} = p.{codart_col} "
+        f"WHERE p.{order_id_col} = TRY_CONVERT(numeric(18,0), ?) "
+        f"ORDER BY p.{codart_col}"
+    )
+
+    rows: List[Dict[str, object]] = []
+    with _connect_sql(settings, timeout=10) as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, (order_id,))
+        for r in cursor.fetchall():
+            rows.append(
+                {
+                    "CodArt": r[0],
+                    "Obs": r[1],
+                    "Estado": r[2],
+                    "DesArt": r[3],
+                }
+            )
+    return rows
 
