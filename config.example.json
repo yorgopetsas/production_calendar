@@ -1,0 +1,41 @@
+{
+  "db_server": "192.168.1.226",
+  "db_port": 14780,
+  "db_name": "YOUR_DATABASE_NAME",
+  "db_user": "gesticom",
+  "db_driver": "ODBC Driver 17 for SQL Server",
+
+  "orders_table": "dbo.Orders",
+  "order_id_field": "OrderID",
+  "delivery_date_field": "DeliveryDate",
+  "window_title": "Calendario Base",
+  "default_sort_by": "client",
+  "default_include_fully_served": false,
+  "default_tip_filters": ["1", "2", "3"],
+
+  "refresh_interval_seconds": 3600,
+  "max_ids_per_day": 50,
+
+  "week_starts_on": "mon",
+  "cell_style": "light",
+
+  "profiles": {
+    "comercial": {
+      "window_title": "Calendario Comercial",
+      "delivery_date_field": "DeliveryDate",
+      "exe_name": "CalendarioComercial",
+      "default_sort_by": "client",
+      "default_include_fully_served": false,
+      "default_tip_filters": ["1", "2", "3"]
+    },
+    "produccion": {
+      "window_title": "Calendario Produccion",
+      "delivery_date_field": "ProductionDate",
+      "exe_name": "CalendarioProduccion",
+      "default_sort_by": "client",
+      "default_include_fully_served": false,
+      "default_tip_filters": ["1", "2", "3"]
+    }
+  }
+}
+
