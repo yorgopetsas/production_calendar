@@ -15,4 +15,5 @@ class OrderItem:
     prod_color: str | None = None  # Optional second circle for production status.
     client_name: str = ""
     revisa_letters: str = ""
+    revisa_modif: bool = False
 

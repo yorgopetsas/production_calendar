@@ -103,12 +103,15 @@ def fetch_orders_by_date(
     settings: Settings,
     start_dt: datetime,
     end_dt: datetime,
-    include_shipped: bool = False,
+    include_fully_served: bool = False,
     tip_ped_values: List[str] | None = None,
 ) -> Dict[date, List[OrderItem]]:
     """
     Fetch orders whose delivery date overlaps the given [start_dt, end_dt) window.
     Returns: {date -> [order_id_str, ...]}
+
+    include_fully_served: when False, restrict to CabPedCli rows with TotalServido = 0
+    ("Servidos: No"). When True, no TotalServido restriction ("Servidos: Todos").
     """
     table = _sanitize_identifier(settings.orders_table)
     order_id_col = _sanitize_identifier(settings.order_id_field)
@@ -123,23 +126,35 @@ def fetch_orders_by_date(
         _sanitize_identifier("RevisaProd"),
         _sanitize_identifier("RevisaTecnico"),
         _sanitize_identifier("RevisaAlm"),
+        _sanitize_identifier("RevisaModif"),
     ]
     status_expr = ", ".join(status_cols)
     prod_table = _sanitize_identifier("dbo.OrdProdCab")
+    total_servido_col = _sanitize_identifier("TotalServido")
 
     # Step 1: fetch calendar orders from CabPedCli.
     delivery_expr = f"TRY_CONVERT(datetime, {delivery_date_col})"
-    years = sorted({start_dt.year, (end_dt - datetime.resolution).year})
-    if len(years) == 1:
-        years_where = f"{cod_eje_col} = ?"
-        years_params = [years[0]]
-    else:
-        years_where = f"{cod_eje_col} IN (?, ?)"
-        years_params = [years[0], years[1]]
+    # Keep FecSer (delivery date) as the primary window, but allow CodEje from
+    # the visible years and their previous years so we include orders created
+    # last year with delivery date in the current year.
+    visible_years = {start_dt.year, (end_dt - datetime.resolution).year}
+    cod_eje_years = sorted(visible_years | {y - 1 for y in visible_years})
+    years_where = f"{cod_eje_col} IN ({','.join('?' for _ in cod_eje_years)})"
+    years_params = cod_eje_years
 
     if not tip_ped_values:
         tip_ped_values = ["1", "2", "3"]
+    else:
+        # Previous behavior (kept commented): always include TipPed=4 as well.
+        # tip_ped_values = list(dict.fromkeys([*tip_ped_values, "4"]))
+        tip_ped_values = list(dict.fromkeys(tip_ped_values))
     tip_placeholders = ",".join("?" for _ in tip_ped_values)
+
+    # When include_fully_served is False, only orders with TotalServido = 0 (CabPedCli).
+    # When True, do not restrict by TotalServido ("Servidos: Todos" in the UI).
+    servidos_where = ""
+    if not include_fully_served:
+        servidos_where = f"  AND ISNULL({total_servido_col}, 0) = 0\n"
 
     sql_orders = (
         f"SELECT {order_id_col}, {delivery_expr}, {client_name_col}, {order_type_col}, {status_expr} "
@@ -148,6 +163,7 @@ def fetch_orders_by_date(
         f"  AND LTRIM(RTRIM(CAST(CodSer AS varchar(20)))) = 'B' "
         f"  AND LTRIM(RTRIM(CAST(TipPed AS varchar(20)))) IN ({tip_placeholders}) "
         f"  AND {years_where} "
+        f"{servidos_where}"
         f"ORDER BY {delivery_expr}, {client_name_col}, {order_id_col}"
     )
 
@@ -159,30 +175,38 @@ def fetch_orders_by_date(
         if not order_rows:
             return orders_by_day
 
-        shipped_order_ids: set[int] = set()
-        if not include_shipped:
-            # Exclude orders already shipped (present in CabAlb by CodPed).
-            alb_table = _sanitize_identifier("dbo.CabAlb")
-            order_ids_for_alb: List[int] = []
-            for r in order_rows:
-                try:
-                    order_ids_for_alb.append(int(r[0]))
-                except Exception:
-                    continue
-            order_ids_for_alb = sorted(set(order_ids_for_alb))
-            if order_ids_for_alb:
-                placeholders = ",".join("?" for _ in order_ids_for_alb)
-                sql_alb = (
-                    f"SELECT DISTINCT CodPed "
-                    f"FROM {alb_table} "
-                    f"WHERE CodPed IN ({placeholders})"
-                )
-                cursor.execute(sql_alb, order_ids_for_alb)
-                for ar in cursor.fetchall():
-                    try:
-                        shipped_order_ids.add(int(ar[0]))
-                    except Exception:
-                        pass
+        # Previous "No Albaranados" / line-based filter (ComPedCli): kept commented for reference.
+        # fully_served_order_ids: set[int] = set()
+        # if not include_fully_served:
+        #     comped_table = _sanitize_identifier("dbo.ComPedCli")
+        #     order_ids_for_comped: List[int] = []
+        #     for r in order_rows:
+        #         try:
+        #             order_ids_for_comped.append(int(r[0]))
+        #         except Exception:
+        #             continue
+        #     order_ids_for_comped = sorted(set(order_ids_for_comped))
+        #     if order_ids_for_comped:
+        #         placeholders = ",".join("?" for _ in order_ids_for_comped)
+        #         sql_comped = (
+        #             f"SELECT CodPed, "
+        #             f"       COUNT(*) AS total_lines, "
+        #             f"       SUM(CASE WHEN (ISNULL(Cantidad,0) - ISNULL(Servidos,0)) > 0 THEN 1 ELSE 0 END) AS pending_lines "
+        #             f"FROM {comped_table} "
+        #             f"WHERE CodPed IN ({placeholders}) "
+        #             f"  AND LTRIM(RTRIM(CAST(CodSer AS varchar(20)))) = 'B' "
+        #             f"GROUP BY CodPed"
+        #         )
+        #         cursor.execute(sql_comped, order_ids_for_comped)
+        #         for cr in cursor.fetchall():
+        #             try:
+        #                 cod_ped = int(cr[0])
+        #                 total_lines = int(cr[1] or 0)
+        #                 pending_lines = int(cr[2] or 0)
+        #             except Exception:
+        #                 continue
+        #             if total_lines > 0 and pending_lines == 0:
+        #                 fully_served_order_ids.add(cod_ped)
 
         # Step 2: fetch production counts from OrdProdCab for ALL listed orders.
         order_ids_numeric: List[int] = []
@@ -215,14 +239,15 @@ def fetch_orders_by_date(
                 oid_check = int(order_id)
             except Exception:
                 oid_check = None
-            if (not include_shipped) and oid_check is not None and oid_check in shipped_order_ids:
-                # Order already exists in CabAlb => sent, do not display.
-                continue
+            # Previous exclusion when ComPedCli indicated fully served (see commented block above).
+            # if (not include_fully_served) and oid_check is not None and oid_check in fully_served_order_ids:
+            #     continue
 
             delivery_dt = row[1]
             client_name = row[2]
             order_type = row[3]
             status_vals = row[4:10]
+            revisa_modif_val = row[10]
             day = _to_date(delivery_dt)
             # Display format requested: `ORDER_ID - ClientName`.
             suffix = str(client_name).strip() if client_name is not None else ""
@@ -281,9 +306,13 @@ def fetch_orders_by_date(
                     prod_color = "#e74c3c"
                 else:
                     prod_color = "#f1c40f"
-            else:
-                # Skip orders without production rows, as requested previously.
-                continue
+            # Keep orders without production rows visible; they render without dot.
+
+            revisa_modif = False
+            try:
+                revisa_modif = int(revisa_modif_val or 0) == 1
+            except Exception:
+                revisa_modif = bool(revisa_modif_val)
 
             orders_by_day.setdefault(day, []).append(
                 OrderItem(
@@ -293,6 +322,7 @@ def fetch_orders_by_date(
                     prod_color=prod_color,
                     client_name=suffix,
                     revisa_letters=revisa_letters,
+                    revisa_modif=revisa_modif,
                 )
             )
 
